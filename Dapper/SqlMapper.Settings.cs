@@ -65,7 +65,7 @@ namespace Dapper
             public static void SetDefaults()
             {
                 CommandTimeout = null;
-                ApplyNullValues = PadListExpansions = UseIncrementalPseudoPositionalParameterNames = PreferTypeHandlersForEnums = false;
+                ApplyNullValues = PadListExpansions = UseIncrementalPseudoPositionalParameterNames = PreferTypeHandlersForEnums = UseTypedAccessors = false;
                 AllowedCommandBehaviors = DefaultAllowedCommandBehaviors;
                 FetchSize = InListStringSplitCount = -1;
             }
@@ -135,6 +135,20 @@ namespace Dapper
             /// This enables custom enum serialization (e.g. storing enums as strings), while preserving existing behavior.
             /// </summary>
             public static bool PreferTypeHandlersForEnums { get; set; }
+
+            /// <summary>
+            /// When enabled, the IL-emitted row deserializer calls typed <see cref="System.Data.IDataRecord"/>
+            /// accessor methods (<c>GetInt32</c>, <c>GetInt64</c>, <c>GetString</c>, etc.) instead of the
+            /// generic <c>GetValue</c>, avoiding per-column boxing allocations for value types. Additionally,
+            /// columns the database schema reports as <c>NOT NULL</c> skip the per-row <c>IsDBNull</c> check.
+            /// </summary>
+            /// <remarks>
+            /// This is an opt-in performance optimization. The setting is read when a row deserializer is
+            /// first compiled for a given query shape; changing it afterwards requires a call to
+            /// <see cref="SqlMapper.PurgeQueryCache"/> for cached deserializers to be re-generated.
+            /// Leave disabled if you encounter compatibility issues with specific ADO.NET providers.
+            /// </remarks>
+            public static bool UseTypedAccessors { get; set; }
 
             private static long s_FetchSize = -1;
         }

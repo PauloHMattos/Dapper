@@ -3210,6 +3210,24 @@ namespace Dapper
                         BindingFlags.Instance | BindingFlags.Public, null, [typeof(int)], null)!;
 
         /// <summary>
+        /// Returns <see langword="false"/> only when the reader schema definitively indicates that the
+        /// column at <paramref name="ordinal"/> is <c>NOT NULL</c>, allowing the IL deserializer to skip
+        /// the per-row <c>IsDBNull</c> call. Defaults to <see langword="true"/> (may be null) for
+        /// providers that do not expose schema information.
+        /// </summary>
+        private static bool GetColumnAllowsDBNull(IDataReader reader, int ordinal)
+        {
+            var schema = reader.GetSchemaTable();
+            if (schema is null) return true;
+            var col = schema.Columns["AllowDBNull"];
+            if (col is null) return true;
+            object allowDbNull = schema.Rows[ordinal][col];
+            // Only skip the null check when the schema explicitly says "false"; treat
+            // any other value (true, DBNull, absent) as "might be null" for safety.
+            return allowDbNull is not false;
+        }
+
+        /// <summary>
         /// Gets type-map for the given type
         /// </summary>
         /// <returns>Type map instance, default is to create new instance of DefaultTypeMap</returns>
@@ -3422,6 +3440,9 @@ namespace Dapper
 
                 if (i < length)
                 {
+                    // canBeNull: when UseTypedAccessors is on, skip IsDBNull for columns the schema
+                    // marks as NOT NULL (safe to omit only when we know the value cannot be NULL).
+                    bool canBeNull = !Settings.UseTypedAccessors || GetColumnAllowsDBNull(reader, startBound + i);
                     LoadReaderValueOrBranchToDBNullLabel(
                         il,
                         startBound + i,
@@ -3429,7 +3450,8 @@ namespace Dapper
                         valueCopyLocal: null,
                         reader.GetFieldType(startBound + i),
                         targetType,
-                        out var isDbNullLabel, out bool popWhenNull);
+                        out var isDbNullLabel, out bool popWhenNull,
+                        canBeNull);
 
                     var finishLabel = il.DefineLabel();
                     il.Emit(OpCodes.Br_S, finishLabel);
@@ -3579,7 +3601,10 @@ namespace Dapper
                     EmitInt32(il, index);
                     il.Emit(OpCodes.Stloc, currentIndexDiagnosticLocal);
 
-                    LoadReaderValueOrBranchToDBNullLabel(il, index, ref stringEnumLocal, valueCopyDiagnosticLocal, reader.GetFieldType(index), memberType, out var isDbNullLabel, out bool popWhenNull);
+                    // canBeNull: when UseTypedAccessors is on, skip IsDBNull for columns the schema
+                    // marks as NOT NULL (safe to omit only when we know the value cannot be NULL).
+                    bool canBeNull = !Settings.UseTypedAccessors || GetColumnAllowsDBNull(reader, index);
+                    LoadReaderValueOrBranchToDBNullLabel(il, index, ref stringEnumLocal, valueCopyDiagnosticLocal, reader.GetFieldType(index), memberType, out var isDbNullLabel, out bool popWhenNull, canBeNull);
 
                     if (specializedConstructor is null)
                     {
@@ -3725,7 +3750,7 @@ namespace Dapper
             }
         }
 
-        private static void LoadReaderValueOrBranchToDBNullLabel(ILGenerator il, int index, ref LocalBuilder? stringEnumLocal, LocalBuilder? valueCopyLocal, Type colType, Type memberType, out Label isDbNullLabel, out bool popWhenNull)
+        private static void LoadReaderValueOrBranchToDBNullLabel(ILGenerator il, int index, ref LocalBuilder? stringEnumLocal, LocalBuilder? valueCopyLocal, Type colType, Type memberType, out Label isDbNullLabel, out bool popWhenNull, bool canBeNull = true)
         {
             isDbNullLabel = il.DefineLabel();
             if (UseGetFieldValue(memberType))
@@ -3734,28 +3759,88 @@ namespace Dapper
                 return;
             }
 
-            popWhenNull = true;
-            il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
-            EmitInt32(il, index); // stack is now [...][reader][index]
-            // default impl: use GetValue
-            il.Emit(OpCodes.Callvirt, getItem); // stack is now [...][value-as-object]
+            // When Settings.UseTypedAccessors is on, use GetFieldValue<colType> (the same method
+            // already used by LoadReaderValueViaGetFieldValue) instead of the generic GetValue,
+            // to avoid boxing allocations for value-type columns.
+            // isValueType is true only when the typed accessor path is taken AND colType is a value
+            // type, meaning an unboxed value will be on the IL stack (not a boxed object reference).
+            bool useTypedAccessor = Settings.UseTypedAccessors;
+            bool isValueType = useTypedAccessor && colType.IsValueType;
 
-            if (valueCopyLocal is not null)
+            if (useTypedAccessor)
             {
-                il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
-                il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][value-as-object]
+                // Typed-accessor path: check IsDBNull BEFORE loading the value (typed accessors
+                // throw for NULL), so the stack is empty when branching to isDbNullLabel.
+                popWhenNull = false;
+                if (canBeNull)
+                {
+                    il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
+                    EmitInt32(il, index); // stack is now [...][reader][index]
+                    il.Emit(OpCodes.Callvirt, isDbNull); // stack is now [...][bool]
+                    il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [...]
+                }
+                il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
+                EmitInt32(il, index); // stack is now [...][reader][index]
+                il.Emit(OpCodes.Callvirt, getFieldValueT.MakeGenericMethod(colType)); // stack is now [...][typed-value]
+
+                if (valueCopyLocal is not null)
+                {
+                    if (isValueType)
+                    {
+                        // Conveying a value-type to the catch block without boxing defeats the
+                        // allocation savings. Store the column's Type as a compromise; ThrowDataException
+                        // detects "value is Type" and reports "[TypeName value]" in the message.
+                        il.Emit(OpCodes.Ldtoken, colType);
+                        il.EmitCall(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle))!, null);
+                        il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][typed-value]
+                    }
+                    else
+                    {
+                        il.Emit(OpCodes.Dup); // stack is now [...][typed-value][typed-value]
+                        il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][typed-value]
+                    }
+                }
+            }
+            else
+            {
+                // Default path: GetValue returns a boxed object; DBNull check is done inline below.
+                popWhenNull = true;
+                il.Emit(OpCodes.Ldarg_0); // stack is now [...][reader]
+                EmitInt32(il, index); // stack is now [...][reader][index]
+                il.Emit(OpCodes.Callvirt, getItem); // stack is now [...][value-as-object]
+
+                if (valueCopyLocal is not null)
+                {
+                    il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
+                    il.Emit(OpCodes.Stloc, valueCopyLocal); // stack is now [...][value-as-object]
+                }
             }
 
             if (memberType == typeof(char) || memberType == typeof(char?))
             {
-                il.EmitCall(OpCodes.Call, typeof(SqlMapper).GetMethod(
-                    memberType == typeof(char) ? nameof(SqlMapper.ReadChar) : nameof(SqlMapper.ReadNullableChar), BindingFlags.Static | BindingFlags.Public)!, null); // stack is now [...][typed-value]
+                if (useTypedAccessor && isValueType) // colType is char; GetChar was called
+                {
+                    // Value is already char on the stack; just wrap in Nullable<char> if needed.
+                    if (memberType == typeof(char?))
+                        il.Emit(OpCodes.Newobj, typeof(char?).GetConstructor([typeof(char)])!);
+                }
+                else
+                {
+                    // Stack has a string (from GetString) or boxed object (from GetValue).
+                    // ReadChar / ReadNullableChar handle both null/DBNull and string-to-char conversion.
+                    il.EmitCall(OpCodes.Call, typeof(SqlMapper).GetMethod(
+                        memberType == typeof(char) ? nameof(SqlMapper.ReadChar) : nameof(SqlMapper.ReadNullableChar), BindingFlags.Static | BindingFlags.Public)!, null); // stack is now [...][typed-value]
+                }
             }
             else
             {
-                il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
-                il.Emit(OpCodes.Isinst, typeof(DBNull)); // stack is now [...][value-as-object][DBNull or null]
-                il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [...][value-as-object]
+                if (!useTypedAccessor)
+                {
+                    // Boxed GetValue path: test for DBNull inline (after the value is on the stack).
+                    il.Emit(OpCodes.Dup); // stack is now [...][value-as-object][value-as-object]
+                    il.Emit(OpCodes.Isinst, typeof(DBNull)); // stack is now [...][value-as-object][DBNull or null]
+                    il.Emit(OpCodes.Brtrue_S, isDbNullLabel); // stack is now [...][value-as-object]
+                }
 
                 // unbox nullable enums as the primitive, i.e. byte etc
 
@@ -3766,6 +3851,8 @@ namespace Dapper
                 {
                     if (Settings.PreferTypeHandlersForEnums && typeHandlers.ContainsKey(unboxType))
                     {
+                        // Box first if the value came from a typed accessor (TypeHandlerCache.Parse expects object).
+                        if (isValueType) il.Emit(OpCodes.Box, colType);
 #pragma warning disable 618
                         il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod(nameof(TypeHandlerCache<int>.Parse))!, null); // stack is now [...][typed-value]
 #pragma warning restore 618
@@ -3787,7 +3874,7 @@ namespace Dapper
                         }
                         else
                         {
-                            FlexibleConvertBoxedFromHeadOfStack(il, colType, unboxType, numericType);
+                            FlexibleConvertBoxedFromHeadOfStack(il, colType, unboxType, numericType, valueIsBoxed: !isValueType);
                         }
                     }
 
@@ -3809,19 +3896,23 @@ namespace Dapper
                     {
                         if (hasTypeHandler)
                         {
+                            // TypeHandlerCache.Parse expects object; box if value came from typed accessor.
+                            if (isValueType) il.Emit(OpCodes.Box, colType);
 #pragma warning disable 618
                             il.EmitCall(OpCodes.Call, typeof(TypeHandlerCache<>).MakeGenericType(unboxType).GetMethod(nameof(TypeHandlerCache<int>.Parse))!, null); // stack is now [...][typed-value]
 #pragma warning restore 618
                         }
                         else
                         {
-                            il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [...][typed-value]
+                            // Direct-match path: for the boxed GetValue path, Unbox_Any is required.
+                            // For the typed accessor path, the value is already the right type.
+                            if (!isValueType) il.Emit(OpCodes.Unbox_Any, unboxType); // stack is now [...][typed-value]
                         }
                     }
                     else
                     {
                         // not a direct match; need to tweak the unbox
-                        FlexibleConvertBoxedFromHeadOfStack(il, colType, nullUnderlyingType ?? unboxType, null);
+                        FlexibleConvertBoxedFromHeadOfStack(il, colType, nullUnderlyingType ?? unboxType, null, valueIsBoxed: !isValueType);
                         if (nullUnderlyingType is not null)
                         {
                             il.Emit(OpCodes.Newobj, unboxType.GetConstructor([nullUnderlyingType])!); // stack is now [...][typed-value]
@@ -3831,17 +3922,20 @@ namespace Dapper
             }
         }
 
-        private static void FlexibleConvertBoxedFromHeadOfStack(ILGenerator il, Type from, Type to, Type? via)
+        private static void FlexibleConvertBoxedFromHeadOfStack(ILGenerator il, Type from, Type to, Type? via, bool valueIsBoxed = true)
         {
             MethodInfo? op;
             if (from == (via ?? to))
             {
-                il.Emit(OpCodes.Unbox_Any, to); // stack is now [target][target][typed-value]
+                // When the column and member types are identical, no conversion is needed.
+                // For the boxed GetValue path, Unbox_Any is required to cast object → T.
+                // For the typed accessor path, the value is already T on the stack.
+                if (valueIsBoxed) il.Emit(OpCodes.Unbox_Any, to); // stack is now [target][target][typed-value]
             }
             else if ((op = GetOperator(from, to)) is not null)
             {
                 // this is handy for things like decimal <===> double
-                il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][data-typed-value]
+                if (valueIsBoxed) il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][data-typed-value]
                 il.Emit(OpCodes.Call, op); // stack is now [target][target][typed-value]
             }
             else
@@ -3893,7 +3987,9 @@ namespace Dapper
                 }
                 if (handled)
                 {
-                    il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][col-typed-value]
+                    // For the boxed path: unbox from object first, then convert.
+                    // For the typed accessor path: value is already unboxed, just convert.
+                    if (valueIsBoxed) il.Emit(OpCodes.Unbox_Any, from); // stack is now [target][target][col-typed-value]
                     il.Emit(opCode); // stack is now [target][target][typed-value]
                     if (to == typeof(bool))
                     { // compare to zero; I checked "csc" - this is the trick it uses; nice
@@ -3905,6 +4001,9 @@ namespace Dapper
                 }
                 else
                 {
+                    // Fallback: box the value (no-op for ref types, boxes value types), then
+                    // use Convert.ChangeType so the JIT handles any remaining conversion.
+                    if (!valueIsBoxed) il.Emit(OpCodes.Box, from); // box typed value for ChangeType call
                     il.Emit(OpCodes.Ldtoken, via ?? to); // stack is now [target][target][value][member-type-token]
                     il.EmitCall(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle))!, null); // stack is now [target][target][value][member-type]
                     il.EmitCall(OpCodes.Call, InvariantCulture, null); // stack is now [target][target][value][member-type][culture]
@@ -3972,6 +4071,12 @@ namespace Dapper
                         if (value is null && ex is InvalidCastException)
                         {
                             formattedValue = "n/a - " + ex.Message; // provide some context
+                        }
+                        else if (value is Type colType)
+                        {
+                            // When UseTypedAccessors is active, value-type column values are not boxed
+                            // for the diagnostic local; the column's Type object is stored instead.
+                            formattedValue = "[" + colType.Name + " value]";
                         }
                         else if (value is null || value is DBNull)
                         {
